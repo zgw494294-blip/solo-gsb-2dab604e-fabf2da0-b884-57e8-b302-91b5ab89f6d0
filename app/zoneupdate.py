@@ -2,7 +2,7 @@
 
 Everything here is pure. Names follow the same normalization as the resolver
 (lowercase, trailing dot, wildcards allowed for record names); values are
-normalized per type (canonical IPv4 for A, absolute names for CNAME/NS).
+normalized per type (canonical IPv4 for A, absolute names for CNAME/NS/PTR).
 Anything malformed raises ZoneError, which the HTTP layer maps to 422.
 """
 from __future__ import annotations
@@ -12,7 +12,7 @@ from typing import Iterable
 
 from .resolver import ZoneError, normalize_name
 
-RECORD_TYPES = ("A", "CNAME", "NS")
+RECORD_TYPES = ("A", "CNAME", "NS", "PTR")
 
 ADD = "add"
 DELETE = "delete"
@@ -43,7 +43,7 @@ Operation = tuple[str, str, str, "str | None"]  # (op, name, type, value)
 def normalize_type(rtype: str) -> str:
     rtype_norm = rtype.strip().upper()
     if rtype_norm not in RECORD_TYPES:
-        raise ZoneError(f"unsupported record type {rtype!r}; only A, CNAME and NS")
+        raise ZoneError(f"unsupported record type {rtype!r}; only A, CNAME, NS and PTR")
     return rtype_norm
 
 

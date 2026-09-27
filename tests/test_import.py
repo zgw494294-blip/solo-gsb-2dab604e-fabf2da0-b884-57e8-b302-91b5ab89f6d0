@@ -349,7 +349,7 @@ def test_unknown_directives_rejected(client, directive):
     assert r.json()["detail"]["line"] == 1
 
 
-@pytest.mark.parametrize("rtype", ["TXT", "AAAA", "SOA", "MX", "PTR", "CAA"])
+@pytest.mark.parametrize("rtype", ["TXT", "AAAA", "SOA", "MX", "CAA"])
 def test_unsupported_record_types_rejected(client, rtype):
     r = import_zone(client, text=f"www {rtype} whatever\n")
     assert r.status_code == 422

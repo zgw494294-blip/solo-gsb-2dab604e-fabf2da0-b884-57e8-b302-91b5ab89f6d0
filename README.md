@@ -1,6 +1,6 @@
 # 离线 DNS 区域应答 API
 
-基于 FastAPI 的离线 DNS 区域解析服务：在请求体中携带整个区域数据，对查询域名执行 **A 查询** 解析，支持 CNAME 链、通配符与 **NS 区域委派**。同时提供 **区域快照与条件更新** 模块：区域数据持久化在 SQLite 中，可按版本与前置条件进行原子更新，并对每个已提交版本留档，支持任意两个版本间的 **差异导出**；也可以把 **DNS 主文件（zone file）文本** 直接导入为版本 0 快照。
+基于 FastAPI 的离线 DNS 区域解析服务：在请求体中携带整个区域数据，对查询域名执行 **A 查询** 解析，或对 IPv4 地址执行 **PTR 反向查询**（`in-addr.arpa.`），支持 CNAME 链、通配符与 **NS 区域委派**。同时提供 **区域快照与条件更新** 模块：区域数据持久化在 SQLite 中，可按版本与前置条件进行原子更新，并对每个已提交版本留档，支持任意两个版本间的 **差异导出**；也可以把 **DNS 主文件（zone file）文本** 直接导入为版本 0 快照。
 
 ## 启动
 
@@ -49,7 +49,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 字段 | 说明 |
 | --- | --- |
 | `zone` | 区域名（如 `example.com`） |
-| `records` | 区域记录列表，支持 `A`、`CNAME` 与 `NS` |
+| `records` | 区域记录列表，支持 `A`、`CNAME`、`NS` 与 `PTR` |
 | `query` | 查询域名 |
 | `qtype` | 查询类型，可选，仅支持 `A`（默认值），其他类型返回 422 |
 
@@ -103,7 +103,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `REFUSED` | 查询域名不在本区域内 |
 | `REFERRAL` | 查询命中委派点或其子树，返回委派点、NS 目标与 glue，不做权威应答 |
 
-区域数据非法（NS 与同名 A/CNAME 共存、顶点或通配符 NS、嵌套委派、CNAME 与其他记录同名、CNAME 目标在区域外、IPv4 格式错误、记录名在区域外、非 A 查询等）返回 `422` 及错误详情。
+区域数据非法（NS 与同名 A/CNAME/PTR 共存、顶点或通配符 NS、嵌套委派、CNAME 与其他记录同名、CNAME 目标在区域外、IPv4 格式错误、记录名在区域外、非 A 查询、PTR 所有者名非法或与 CNAME/NS 同名等）返回 `422` 及错误详情。
 
 ### 解析规则
 
@@ -125,6 +125,59 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - 区域外（或不在本子树内）的 NS 目标不带 glue。
 - CNAME 链在跟随过程中跨入委派子树（包括正好落在委派点）时，保留已走过的链并返回 `REFERRAL`。
 
+### `POST /reverse`
+
+对 IPv4 地址做 **PTR 反向查询**。服务把 `address` 的四个八位组倒序拼成 `<d>.<c>.<b>.<a>.in-addr.arpa.` 查询名，在请求携带的反向区域内解析 PTR 记录。请求体：
+
+```json
+{
+  "zone": "168.192.in-addr.arpa",
+  "records": [
+    {"name": "10.1.168.192.in-addr.arpa", "type": "PTR", "value": "host.example.com."},
+    {"name": "10.1.168.192.in-addr.arpa", "type": "PTR", "value": "alias.example.com."}
+  ],
+  "address": "192.168.1.10"
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `zone` | 反向区域，限 `in-addr.arpa.` 本身或其**至多四段**合法 IPv4 数字标签子域（每段 `0`～`255`、无前导零），如 `192.in-addr.arpa`、`168.192.in-addr.arpa` |
+| `records` | 区域记录列表，规则同 `POST /resolve`，可含 `PTR` |
+| `address` | 待反查的 IPv4 地址（点分四段） |
+
+正常响应（`200 OK`）：
+
+```json
+{
+  "zone": "168.192.in-addr.arpa.",
+  "address": "192.168.1.10",
+  "query": "10.1.168.192.in-addr.arpa.",
+  "status": "NOERROR",
+  "chain": ["10.1.168.192.in-addr.arpa."],
+  "hostnames": ["alias.example.com.", "host.example.com."],
+  "delegation": null,
+  "nameservers": [],
+  "glue": [],
+  "error": null
+}
+```
+
+- `query`：由 `address` 生成的反查域名（八位组倒序、小写、末尾带点）。
+- `hostnames`：最终名称上**去重并按字典序排序**的 PTR 目标主机名；`REFERRAL` 时恒为 `[]`。
+- `chain`、`delegation`、`nameservers`、`glue`、`error` 语义与 `POST /resolve` 相同。
+- `status` 取值与 `POST /resolve` 相同：`NOERROR`（命中 PTR）、`NODATA`（名称存在但没有 PTR 记录）、`NXDOMAIN`（名称不存在）、`CNAME_LOOP`、`REFUSED`（反查名在区域外）、`REFERRAL`（命中委派，不返回主机名）。
+
+PTR 记录规则：
+
+- **所有者名**必须是区域内**完整的四段反序 IPv4 名**（`<d>.<c>.<b>.<a>.in-addr.arpa.`，每段 `0`～`255`、无前导零），**不允许通配符**。
+- 同名允许**多条 PTR**；目标规范化为绝对域名（小写、末尾带点），**可位于区域外**。
+- PTR 不得与 CNAME/NS 同名（与 A 同名允许）。
+- 通配符匹配、空节点、CNAME 链与委派（REFERRAL/glue）规则与正向解析完全一致；委派子树内的 PTR 记录不是权威数据。
+- 非法地址、非法反向区域或非法记录返回 `422`。
+
+PTR 记录同样可经 `POST /zones`、`POST /zones/{id}/updates` 与 `POST /zones/import` 进入快照并随版本留档（导入时无尾点的 PTR 目标相对当前 origin 展开），可参与 `GET /zones/{id}/diff` 差异导出。
+
 ### `POST /zones`
 
 用 `zone` 与 `records` 建立 SQLite 区域快照。请求体与 `POST /resolve` 的前两个字段相同：
@@ -138,7 +191,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 }
 ```
 
-- 记录先做规范化（域名小写带尾点、类型大写、IPv4 规范化、NS/CNAME 目标转绝对域名）并去重，再按与 `/resolve` 相同的规则校验整个区域；非法输入返回 `422`。
+- 记录先做规范化（域名小写带尾点、类型大写、IPv4 规范化、NS/CNAME/PTR 目标转绝对域名）并去重，再按与 `/resolve` 相同的规则校验整个区域；非法输入返回 `422`。
 - **委派子树内的输入记录原样保留**（glue 及其他暂非权威的记录都存入快照），不经过解析时的裁剪。
 - 响应 `200`：`{"id": "...", "version": 0, "zone": "example.com.", "records": [...]}`，其中 `records` 为规范化、去重后按 `(name, type, value)` 排序的完整快照。
 
@@ -155,11 +208,11 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 支持的语法（RFC 1035 主文件的严格子集）：
 
-- 仅支持 `A`、`CNAME`、`NS` 三种记录类型（大小写不限），其他类型一律拒绝。
+- 仅支持 `A`、`CNAME`、`NS`、`PTR` 四种记录类型（大小写不限），其他类型一律拒绝。
 - `;` 起到行尾为注释；空行被忽略。
 - 括号 `(` `)` 允许一条逻辑记录跨越多行；括号不可嵌套，未闭合或不配对均报错。
 - 初始 origin 为 `zone`；`$ORIGIN <名>` 切换当前 origin。
-- `@` 表示当前 origin；无尾点的**记录名、CNAME/NS 目标与 `$ORIGIN` 参数**均相对当前 origin 展开，带尾点的名为绝对名。
+- `@` 表示当前 origin；无尾点的**记录名、CNAME/NS/PTR 目标与 `$ORIGIN` 参数**均相对当前 origin 展开，带尾点的名为绝对名。
 - 逻辑记录首字符为空白（空格或制表符）时省略记录名，沿用上一条记录**已展开**的名称；切换 origin 不改变该名称；首条记录省名报错。
 - 类型之前可省略或填写 `IN` 与非负十进制 TTL，二者顺序不限；`$TTL` 指令同理。**TTL 只校验不存储**。
 - 引号、转义（`\`）以及其他 `$` 指令（如 `$INCLUDE`、`$GENERATE`）均拒绝。
@@ -267,6 +320,26 @@ curl -s http://localhost:8000/resolve \
         ],
         "query": "www.del.example.com"
       }'
+```
+
+IPv4 地址反查（PTR，服务端口同为 **8000**）：
+
+```bash
+curl -s http://localhost:8000/reverse \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "zone": "168.192.in-addr.arpa",
+        "records": [
+          {"name": "10.1.168.192.in-addr.arpa", "type": "PTR", "value": "host.example.com."},
+          {"name": "10.1.168.192.in-addr.arpa", "type": "PTR", "value": "alias.example.com."}
+        ],
+        "address": "192.168.1.10"
+      }'
+# => {"zone":"168.192.in-addr.arpa.","address":"192.168.1.10",
+#     "query":"10.1.168.192.in-addr.arpa.","status":"NOERROR",
+#     "chain":["10.1.168.192.in-addr.arpa."],
+#     "hostnames":["alias.example.com.","host.example.com."],
+#     "delegation":null,"nameservers":[],"glue":[],"error":null}
 ```
 
 建立快照并做条件更新：

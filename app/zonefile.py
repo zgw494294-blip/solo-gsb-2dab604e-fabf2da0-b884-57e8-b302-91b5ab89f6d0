@@ -5,9 +5,9 @@ Supported grammar (a strict subset of RFC 1035 master files):
 - blank lines and ``;`` comments (a comment runs to the end of the line);
 - non-nested parentheses joining one logical record across physical lines;
 - ``$ORIGIN`` and ``$TTL`` directives (every other directive is rejected);
-- A, CNAME and NS records only, with an optional non-negative decimal TTL
-  and an optional ``IN`` class before the type, in any order;
-- ``@`` for the current origin; owner names, CNAME/NS targets and the
+- A, CNAME, NS and PTR records only, with an optional non-negative decimal
+  TTL and an optional ``IN`` class before the type, in any order;
+- ``@`` for the current origin; owner names, CNAME/NS/PTR targets and the
   ``$ORIGIN`` argument without a trailing dot are relative to the current
   origin (initially the zone itself);
 - a logical record whose first character is whitespace omits the owner
@@ -28,7 +28,7 @@ from .resolver import ZoneError, normalize_name
 
 _TTL_RE = re.compile(r"[0-9]+")
 _CLASS = "IN"
-_TYPES = ("A", "CNAME", "NS")
+_TYPES = ("A", "CNAME", "NS", "PTR")
 
 
 class MasterFileError(ValueError):
@@ -101,7 +101,7 @@ def _check_ttl(token: str, start: int) -> None:
 def parse_zone_file(zone: str, text: str) -> list[tuple[str, str, str]]:
     """Parse ``text`` (master file subset) into ``(name, type, value)`` tuples.
 
-    Owner names and CNAME/NS targets are expanded to absolute names using
+    Owner names and CNAME/NS/PTR targets are expanded to absolute names using
     the running origin (initially ``zone``). The tuples are not normalized
     or validated beyond syntax; that is shared with POST /zones.
     """
@@ -162,7 +162,7 @@ def parse_zone_file(zone: str, text: str) -> list[tuple[str, str, str]]:
         rtype = rest.pop(0).upper()
         if rtype not in _TYPES:
             raise MasterFileError(
-                f"unsupported record type {rtype!r}; only A, CNAME and NS", start
+                f"unsupported record type {rtype!r}; only A, CNAME, NS and PTR", start
             )
         if not rest:
             raise MasterFileError(f"missing value for {rtype} record", start)
