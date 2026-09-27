@@ -1,18 +1,29 @@
 """Offline DNS zone resolution logic.
 
-Only A queries are handled. Names are case-insensitive and normalized with a
-trailing dot. Wildcard matching follows RFC 1034 semantics: find the closest
-encloser (longest existing ancestor, empty non-terminals included) and look
-for a ``*`` record directly below it.
+Forward queries (``resolve``) handle A records; reverse queries
+(``resolve_ptr``) handle PTR records against ``in-addr.arpa.`` zones.
+Names are case-insensitive and normalized with a trailing dot. Wildcard
+matching follows RFC 1034 semantics: find the closest encloser (longest
+existing ancestor, empty non-terminals included) and look for a ``*``
+record directly below it. Wildcard PTR records are never allowed.
+
+Reverse zones are ``in-addr.arpa.`` itself or a subdomain made of at most
+four canonical IPv4 octet labels (``2.0.192.in-addr.arpa.``). A PTR owner
+must be the full four-octet reversed IPv4 name, e.g.
+``1.2.0.192.in-addr.arpa.`` for ``192.0.2.1``: every octet is 0..255
+without leading zeros, and the name must not be a wildcard. Multiple PTR
+records may share an owner; targets are canonical absolute names and may
+live outside the zone. A PTR owner may not share its name with a CNAME or
+an NS record.
 
 Zone delegation: multiple NS records may be placed at any non-apex,
 non-wildcard name ("delegation point"). NS targets are normalized to absolute
 names and may live outside the zone. A name may not hold NS together with
-A/CNAME records and delegations may not nest. The delegation boundary is
+A/CNAME/PTR records and delegations may not nest. The delegation boundary is
 checked first, so a query at or below a delegation point yields a REFERRAL
-even when an exact A record or an upper wildcard would otherwise match. An A
-record at an in-subtree NS target acts as glue; glue is only returned inside a
-referral and is never authoritative on its own.
+even when an exact record or an upper wildcard would otherwise match. An A
+record at an in-subtree NS target acts as glue; glue is only returned inside
+a referral and is never authoritative on its own.
 """
 from __future__ import annotations
 
@@ -73,6 +84,90 @@ def _ipv4(address: str, *, where: str) -> str:
         raise ZoneError(f"invalid IPv4 address {address!r} for {where}") from exc
 
 
+IN_ADDR_ARPA = "in-addr.arpa."
+
+
+def is_reverse_apex(name: str) -> bool:
+    """True iff the normalized absolute ``name`` is an in-addr.arpa. name."""
+    return name == IN_ADDR_ARPA or name.endswith("." + IN_ADDR_ARPA)
+
+
+def _reverse_octet(label: str) -> bool:
+    """True iff ``label`` is a canonical IPv4 octet: 0..255, no leading zero."""
+    if not label or not label.isdigit() or len(label) > 3:
+        return False
+    if len(label) > 1 and label[0] == "0":
+        return False
+    return int(label) <= 255
+
+
+def check_reverse_apex(apex: str) -> None:
+    """Validate that normalized ``apex`` is a legal reverse zone.
+
+    It must equal ``in-addr.arpa.`` or be a subdomain of it made of at most
+    four canonical IPv4 octet labels. Anything else raises ZoneError.
+    """
+    if apex == IN_ADDR_ARPA:
+        return
+    if not is_reverse_apex(apex):
+        raise ZoneError(
+            f"reverse zone must be {IN_ADDR_ARPA} or an IPv4 label subdomain"
+            f" of it, got {apex}"
+        )
+    labels = apex[: -len(IN_ADDR_ARPA) - 1].split(".")
+    if len(labels) > 4:
+        raise ZoneError(f"reverse zone {apex} has more than four IPv4 labels")
+    for label in labels:
+        if not _reverse_octet(label):
+            raise ZoneError(
+                f"invalid reverse zone label {label!r} in {apex}: each label"
+                " must be an IPv4 octet 0..255 without leading zeros"
+            )
+
+
+def check_ptr_owner(name: str, apex: str) -> None:
+    """Validate a PTR owner inside reverse zone ``apex``.
+
+    The owner must be an explicit (non-wildcard) full four-octet reversed
+    IPv4 name relative to ``in-addr.arpa.``: the labels fixed by the apex
+    are inherited and the owner must supply the remaining octets.
+    """
+    if name.startswith("*."):
+        raise ZoneError(f"PTR records must not be wildcard records: {name}")
+    if name == IN_ADDR_ARPA:
+        owner_part = ""
+    else:
+        owner_part = name[: -len(IN_ADDR_ARPA) - 1]
+    owner_labels = owner_part.split(".") if owner_part else []
+    if len(owner_labels) != 4:
+        raise ZoneError(
+            f"PTR owner {name} must be the full four-octet reversed IPv4 name"
+            f" in zone {apex}"
+        )
+    for label in owner_labels:
+        if not _reverse_octet(label):
+            raise ZoneError(
+                f"PTR owner {name} label {label!r} is not a canonical IPv4"
+                " octet (0..255, no leading zeros)"
+            )
+
+
+def reverse_address_name(address: str) -> tuple[str, str]:
+    """Return ``(canonical_address, reversed owner name)`` for an IPv4 address.
+
+    Only a strict dotted-quad is accepted (no whitespace, no extra labels,
+    no leading zeros), so the caller can distinguish a malformed address
+    (422) from an address merely outside the zone (REFUSED).
+    """
+    if not isinstance(address, str):
+        raise ZoneError("IPv4 address must be a string")
+    parts = address.split(".")
+    if len(parts) != 4 or not all(_reverse_octet(p) for p in parts):
+        raise ZoneError(f"invalid IPv4 address {address!r}")
+    canonical = ".".join(str(int(p)) for p in parts)
+    return canonical, ".".join(reversed(parts)) + "." + IN_ADDR_ARPA
+
+
 class Zone:
     """A DNS zone: authoritative records, delegations and glue.
 
@@ -83,7 +178,8 @@ class Zone:
 
     def __init__(self, apex: str):
         self.apex = apex
-        # authoritative name -> {"A": [addresses]} or {"CNAME": target}
+        # authoritative name -> {"A": [addresses]} or {"CNAME": target} or
+        # {"PTR": [targets]}
         self.records: dict[str, dict[str, object]] = {}
         # every authoritative existing name, including empty non-terminals and
         # the apex, plus the delegation points themselves
@@ -124,6 +220,15 @@ class Zone:
             rec["A"].append(addr)
         self._add_node(name)
 
+    def add_ptr(self, name: str, target: str) -> None:
+        existing = self.records.get(name)
+        if existing is not None and "CNAME" in existing:
+            raise ZoneError(f"PTR record at {name} conflicts with existing CNAME record")
+        rec = self.records.setdefault(name, {"PTR": []})
+        if target not in rec["PTR"]:
+            rec["PTR"].append(target)
+        self._add_node(name)
+
     def add_cname(self, name: str, target: str) -> None:
         if name in self.records:
             raise ZoneError(f"CNAME record at {name} conflicts with existing record(s)")
@@ -136,18 +241,33 @@ class Zone:
 def build_zone(zone_name: str, records: Iterable[tuple[str, str, str]]) -> Zone:
     """Build and validate a Zone from ``(name, type, value)`` record tuples."""
     apex = normalize_name(zone_name)
+    reverse = is_reverse_apex(apex)
+    if reverse:
+        check_reverse_apex(apex)
     zone = Zone(apex)
 
-    # name -> {"A": [values], "CNAME": [targets], "NS": [targets]}
+    # name -> {"A": [values], "CNAME": [targets], "NS": [targets],
+    #          "PTR": [targets]}
     parsed: dict[str, dict[str, list[str]]] = {}
     for raw_name, raw_type, raw_value in records:
         rtype = raw_type.strip().upper()
-        if rtype not in ("A", "CNAME", "NS"):
-            raise ZoneError(f"unsupported record type {raw_type!r}; only A, CNAME and NS")
+        if rtype not in ("A", "CNAME", "NS", "PTR"):
+            raise ZoneError(
+                f"unsupported record type {raw_type!r}; only A, CNAME, NS and PTR"
+            )
         name = normalize_name(raw_name, allow_wildcard=True)
         if not zone.in_zone(name):
             raise ZoneError(f"record name {name} is outside zone {apex}")
-        parsed.setdefault(name, {"A": [], "CNAME": [], "NS": []})[rtype].append(raw_value)
+        if rtype == "PTR":
+            if not reverse:
+                raise ZoneError(
+                    f"PTR records are only allowed in reverse zones"
+                    f" ({IN_ADDR_ARPA} and subdomains), not in {apex}"
+                )
+            check_ptr_owner(name, apex)
+        parsed.setdefault(
+            name, {"A": [], "CNAME": [], "NS": [], "PTR": []}
+        )[rtype].append(raw_value)
 
     cuts = [name for name, kinds in parsed.items() if kinds["NS"]]
     for cut in cuts:
@@ -160,6 +280,8 @@ def build_zone(zone_name: str, records: Iterable[tuple[str, str, str]]) -> Zone:
             raise ZoneError(f"NS record at {cut} conflicts with A record(s) at the same name")
         if kinds["CNAME"]:
             raise ZoneError(f"NS record at {cut} conflicts with CNAME record at the same name")
+        if kinds["PTR"]:
+            raise ZoneError(f"NS record at {cut} conflicts with PTR record(s) at the same name")
 
     def enclosing_cut(name: str) -> str | None:
         best = None
@@ -172,8 +294,11 @@ def build_zone(zone_name: str, records: Iterable[tuple[str, str, str]]) -> Zone:
     # CNAME exclusivity also applies to inert records buried under a cut.
     # CNAME+NS can only occur at a cut name and is already rejected above.
     for name, kinds in parsed.items():
-        if kinds["CNAME"] and kinds["A"]:
-            raise ZoneError(f"CNAME record at {name} conflicts with A record(s)")
+        cname_count = len(kinds["CNAME"])
+        if cname_count > 1:
+            raise ZoneError(f"multiple CNAME records at {name}")
+        if cname_count and (kinds["A"] or kinds["PTR"]):
+            raise ZoneError(f"CNAME record at {name} conflicts with other record(s)")
 
     # Populate delegations and glue; collect authoritative records.
     for cut in cuts:
@@ -188,12 +313,16 @@ def build_zone(zone_name: str, records: Iterable[tuple[str, str, str]]) -> Zone:
             # Above every cut (or the cut node itself, which only carries NS).
             for value in kinds["A"]:
                 zone.add_a(name, value)
+            for raw_target in kinds["PTR"]:
+                zone.add_ptr(name, normalize_name(raw_target))
             for raw_target in kinds["CNAME"]:
                 zone.add_cname(name, normalize_name(raw_target))
             continue
         # Below a delegation cut: records are not authoritative. A records are
         # kept only as glue when the name is an in-subtree NS target; anything
-        # else (other A records, CNAMEs, ...) is inert.
+        # else (other A records, CNAMEs, PTRs, ...) is inert. Inert CNAMEs are
+        # normalized but never followed, so their in-zone target rule is not
+        # enforced here.
         glue = zone.glue[cut]
         if name in glue:
             for value in kinds["A"]:
@@ -249,25 +378,24 @@ class Resolution:
     status: str
     chain: list[str] = field(default_factory=list)
     addresses: list[str] = field(default_factory=list)
+    ptrs: list[str] = field(default_factory=list)
     error: str | None = None
     delegation: str | None = None
     nameservers: list[str] = field(default_factory=list)
     glue: list[dict[str, object]] = field(default_factory=list)
 
 
-def resolve(zone: Zone, query: str, qtype: str = "A") -> Resolution:
-    """Resolve an A query for ``query`` inside ``zone``."""
-    if qtype.strip().upper() != "A":
-        raise ZoneError(f"unsupported query type {qtype!r}; only A queries are handled")
-    qname = normalize_name(query)
+def _resolve(zone: Zone, qname: str, rtype: str) -> Resolution:
+    """Resolve an A or PTR query for the already-normalized ``qname``."""
     if not zone.in_zone(qname):
         return Resolution(
             status=REFUSED,
+            chain=[qname],
             error=f"query name {qname} is outside zone {zone.apex}",
         )
 
     # The delegation boundary is checked before anything else, so neither an
-    # exact A record nor an upper wildcard can bypass it.
+    # exact record nor an upper wildcard can bypass it.
     cut = zone.covering_delegation(qname)
     if cut is not None:
         return _referral(zone, cut, [qname])
@@ -289,15 +417,45 @@ def resolve(zone: Zone, query: str, qtype: str = "A") -> Resolution:
             rec = _wildcard_records(zone, current)
             if rec is None:
                 return Resolution(status=NXDOMAIN, chain=chain)
-        if "A" in rec:
-            return Resolution(status=NOERROR, chain=chain, addresses=list(rec["A"]))
-        target = rec["CNAME"]
-        chain.append(target)
-        if target in visited:
+        # CNAME is followed first: a CNAME node never coexists with other
+        # record types, so checking it before rtype mirrors the A behaviour.
+        if "CNAME" in rec:
+            target = rec["CNAME"]
+            chain.append(target)
+            if target in visited:
+                return Resolution(
+                    status=CNAME_LOOP,
+                    chain=chain,
+                    error="CNAME loop detected: " + " -> ".join(chain),
+                )
+            visited.add(target)
+            current = target
+            continue
+        if rtype in rec:
+            if rtype == "A":
+                return Resolution(status=NOERROR, chain=chain, addresses=list(rec["A"]))
             return Resolution(
-                status=CNAME_LOOP,
-                chain=chain,
-                error="CNAME loop detected: " + " -> ".join(chain),
+                status=NOERROR, chain=chain, ptrs=sorted(rec["PTR"])
             )
-        visited.add(target)
-        current = target
+        # The name exists (exactly, via a wildcard, or as an empty node) but
+        # holds no record of the queried type.
+        return Resolution(status=NODATA, chain=chain)
+
+
+def resolve(zone: Zone, query: str, qtype: str = "A") -> Resolution:
+    """Resolve an A query for ``query`` inside ``zone``."""
+    if qtype.strip().upper() != "A":
+        raise ZoneError(f"unsupported query type {qtype!r}; only A queries are handled")
+    qname = normalize_name(query)
+    return _resolve(zone, qname, "A")
+
+
+def resolve_ptr(zone: Zone, qname: str) -> Resolution:
+    """Resolve a PTR query for the already normalized ``qname``.
+
+    The caller builds ``qname`` from an IPv4 address with
+    :func:`reverse_address_name`; the same wildcard, empty-node, CNAME and
+    delegation rules as for A queries apply, with CNAME chains reported in
+    ``chain`` and deduplicated PTR targets sorted in ``ptrs``.
+    """
+    return _resolve(zone, qname, "PTR")

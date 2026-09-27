@@ -12,7 +12,7 @@ from typing import Iterable
 
 from .resolver import ZoneError, normalize_name
 
-RECORD_TYPES = ("A", "CNAME", "NS")
+RECORD_TYPES = ("A", "CNAME", "NS", "PTR")
 
 ADD = "add"
 DELETE = "delete"
@@ -43,7 +43,9 @@ Operation = tuple[str, str, str, "str | None"]  # (op, name, type, value)
 def normalize_type(rtype: str) -> str:
     rtype_norm = rtype.strip().upper()
     if rtype_norm not in RECORD_TYPES:
-        raise ZoneError(f"unsupported record type {rtype!r}; only A, CNAME and NS")
+        raise ZoneError(
+            f"unsupported record type {rtype!r}; only A, CNAME, NS and PTR"
+        )
     return rtype_norm
 
 
@@ -53,7 +55,7 @@ def normalize_value(rtype: str, value: str) -> str:
             return str(ipaddress.IPv4Address(value))
         except ipaddress.AddressValueError as exc:
             raise ZoneError(f"invalid IPv4 address {value!r}") from exc
-    return normalize_name(value)
+    return normalize_name(value)  # CNAME, NS and PTR targets are absolute names
 
 
 def normalize_record(name: str, rtype: str, value: str) -> Record:

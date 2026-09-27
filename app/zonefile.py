@@ -5,7 +5,7 @@ Supported grammar (a strict subset of RFC 1035 master files):
 - blank lines and ``;`` comments (a comment runs to the end of the line);
 - non-nested parentheses joining one logical record across physical lines;
 - ``$ORIGIN`` and ``$TTL`` directives (every other directive is rejected);
-- A, CNAME and NS records only, with an optional non-negative decimal TTL
+- A, CNAME, NS and PTR records only, with an optional non-negative decimal TTL
   and an optional ``IN`` class before the type, in any order;
 - ``@`` for the current origin; owner names, CNAME/NS targets and the
   ``$ORIGIN`` argument without a trailing dot are relative to the current
@@ -28,7 +28,7 @@ from .resolver import ZoneError, normalize_name
 
 _TTL_RE = re.compile(r"[0-9]+")
 _CLASS = "IN"
-_TYPES = ("A", "CNAME", "NS")
+_TYPES = ("A", "CNAME", "NS", "PTR")
 
 
 class MasterFileError(ValueError):
@@ -162,7 +162,8 @@ def parse_zone_file(zone: str, text: str) -> list[tuple[str, str, str]]:
         rtype = rest.pop(0).upper()
         if rtype not in _TYPES:
             raise MasterFileError(
-                f"unsupported record type {rtype!r}; only A, CNAME and NS", start
+                f"unsupported record type {rtype!r}; only A, CNAME, NS and PTR",
+                start,
             )
         if not rest:
             raise MasterFileError(f"missing value for {rtype} record", start)
@@ -174,6 +175,8 @@ def parse_zone_file(zone: str, text: str) -> list[tuple[str, str, str]]:
             )
         value = rest[0]
         if rtype != "A":
+            # CNAME, NS and PTR targets without a trailing dot are relative to
+            # the current origin.
             value = _expand_name(value, origin)
         records.append((name, rtype, value))
     return records

@@ -7,7 +7,16 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import AliasChoices, BaseModel, Field
 
 from . import store as zone_store
-from .resolver import Resolution, ZoneError, build_zone, normalize_name, resolve
+from .resolver import (
+    Resolution,
+    ZoneError,
+    build_zone,
+    check_reverse_apex,
+    normalize_name,
+    resolve,
+    resolve_ptr,
+    reverse_address_name,
+)
 from .zonefile import MasterFileError, parse_zone_file
 from .zoneupdate import (
     normalize_operation,
@@ -25,18 +34,18 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="Offline DNS Zone Resolver",
     version="1.0.0",
-    summary="Resolve A queries against a zone supplied in the request body.",
+    summary="Resolve A and PTR queries against a zone supplied in the request body.",
     lifespan=lifespan,
 )
 
 
 class RecordIn(BaseModel):
     name: str = Field(..., examples=["www.example.com"])
-    type: str = Field(..., examples=["A"], description="A, CNAME or NS")
+    type: str = Field(..., examples=["A"], description="A, CNAME, NS or PTR")
     value: str = Field(
         ...,
         examples=["192.0.2.1"],
-        description="IPv4 address, CNAME target or NS nameserver target",
+        description="IPv4 address, CNAME/PTR target or NS nameserver target",
     )
 
 
@@ -77,12 +86,50 @@ class ResolveResponse(BaseModel):
     error: str | None = None
 
 
+class ReverseRequest(BaseModel):
+    zone: str = Field(..., examples=["2.0.192.in-addr.arpa"])
+    records: list[RecordIn] = Field(default_factory=list)
+    address: str = Field(..., examples=["192.0.2.1"])
+
+
+class ReverseResponse(BaseModel):
+    zone: str
+    address: str = Field(..., description="Canonical IPv4 address from the request")
+    query: str = Field(
+        ...,
+        description="The in-addr.arpa. query name built from the reversed octets",
+    )
+    status: str = Field(
+        ...,
+        description="NOERROR | NODATA | NXDOMAIN | CNAME_LOOP | REFUSED | REFERRAL",
+    )
+    chain: list[str] = Field(..., description="Names visited while following CNAMEs")
+    names: list[str] = Field(
+        default_factory=list,
+        description="NOERROR only: deduplicated, sorted PTR hostnames (absolute)",
+    )
+    delegation: str | None = Field(
+        default=None,
+        description="REFERRAL only: the delegation point that owns the answer",
+    )
+    nameservers: list[str] = Field(
+        default_factory=list,
+        description="REFERRAL only: deduplicated, sorted NS targets",
+    )
+    glue: list[GlueRecord] = Field(
+        default_factory=list,
+        description="REFERRAL only: glue records for in-subtree NS targets",
+    )
+    error: str | None = None
+
+
 @app.get("/")
 def index() -> dict[str, str]:
     return {
         "service": "offline-dns-resolver",
         "docs": "/docs",
         "resolve": "POST /resolve",
+        "reverse": "POST /reverse",
         "zones": "POST /zones",
         "import": "POST /zones/import",
     }
@@ -102,6 +149,30 @@ def resolve_endpoint(req: ResolveRequest) -> ResolveResponse:
         status=result.status,
         chain=result.chain,
         addresses=result.addresses,
+        delegation=result.delegation,
+        nameservers=result.nameservers,
+        glue=result.glue,
+        error=result.error,
+    )
+
+
+@app.post("/reverse", response_model=ReverseResponse)
+def reverse_endpoint(req: ReverseRequest) -> ReverseResponse:
+    try:
+        apex = normalize_name(req.zone)
+        check_reverse_apex(apex)
+        canonical, qname = reverse_address_name(req.address)
+        zone = build_zone(apex, [(r.name, r.type, r.value) for r in req.records])
+        result: Resolution = resolve_ptr(zone, qname)
+    except ZoneError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return ReverseResponse(
+        zone=zone.apex,
+        address=canonical,
+        query=qname,
+        status=result.status,
+        chain=result.chain,
+        names=result.ptrs,
         delegation=result.delegation,
         nameservers=result.nameservers,
         glue=result.glue,
@@ -198,7 +269,7 @@ class ZoneImportRequest(BaseModel):
     zone: str = Field(..., examples=["example.com"])
     text: str = Field(
         ...,
-        description="DNS master file subset: A/CNAME/NS records, $ORIGIN/$TTL "
+        description="DNS master file subset: A/CNAME/NS/PTR records, $ORIGIN/$TTL "
         "directives, ';' comments and parentheses",
         examples=["$TTL 3600\nwww A 192.0.2.1\n"],
     )
